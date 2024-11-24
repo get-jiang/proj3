@@ -1,7 +1,62 @@
 use pcap::Capture;
+use std::ptr::null_mut;
+
 use std::net::Ipv4Addr;
+use windows::core::{PCSTR, PCWSTR};
+use windows::Win32::Foundation::{FARPROC, HANDLE, HMODULE};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 
 fn main() {
+    use std::sync::Arc;
+
+    //Must be run as Administrator because we create network adapters
+    //Load the wintun dll file so that we can call the underlying C functions
+    //Unsafe because we are loading an arbitrary dll file
+    let wintun =
+        unsafe { wintun::load_from_path("wintun.dll") }.expect("Failed to load wintun dll");
+
+    //Try to open an adapter with the name "Demo"
+    let adapter = match wintun::Adapter::open(&wintun, "Demo") {
+        Ok(a) => a,
+        Err(_) => {
+            println!("Failed to open wintun adapter, creating a new one");
+            //If loading failed (most likely it didn't exist), create a new one
+            wintun::Adapter::create(&wintun, "Demo", "Example", None)
+                .expect("Failed to create wintun adapter!")
+        }
+    };
+    //Specify the size of the ring buffer the wintun driver should use.
+    let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
+
+    //Get a 20 byte packet from the ring buffer
+    loop {
+        println!("Sending packet");
+        let mut packet = session.allocate_send_packet(12).unwrap();
+        let bytes: &mut [u8] = packet.bytes_mut();
+        //Write IPV4 version and header length
+        bytes[0] = 0x40;
+
+        //Finish writing IP header
+        bytes[9] = 0x69;
+        bytes[10] = 0x04;
+        bytes[11] = 0x20;
+        //Send the packet to wintun virtual adapter for processing by the system
+        session.send_packet(packet);
+    }
+    //Stop any readers blocking for data on other threads
+    //Only needed when a blocking reader is preventing shutdown Ie. it holds an Arc to the
+    //session, blocking it from being dropped
+    // session.shutdown();
+
+    //the session is stopped on drop
+    //drop(session);
+
+    //drop(adapter)
+    //And the adapter closes its resources when dropped
+    // 后续操作：读写适配器的网络流量...
+}
+
+fn send_ping() {
     // 替换为你的网卡设备名
     let device_name = "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}";
     let mut cap = Capture::from_device(device_name).unwrap().open().unwrap();
@@ -12,9 +67,9 @@ fn main() {
     let dst_mac = [0x00, 0x00, 0x5e, 0x00, 0x01, 0x01];
 
     // 本机 IP 地址
-    let src_ip = Ipv4Addr::new(10, 20, 167, 203);
+    let src_ip = Ipv4Addr::new(172, 18, 1, 1);
     // 目标设备 IP 地址（Ping 的目标地址）
-    let dst_ip = Ipv4Addr::new(10, 20, 236, 229);
+    let dst_ip = Ipv4Addr::new(172, 18, 1, 2);
 
     // ICMP Echo 请求的初始序列号和标识符
     let identifier = 1;
