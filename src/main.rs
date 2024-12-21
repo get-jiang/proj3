@@ -1,143 +1,274 @@
-use pcap::Capture;
-use std::ptr::null_mut;
-
+use pnet::datalink::{self, Channel::Ethernet, NetworkInterface};
+use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
+use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
+use pnet::packet::tcp::{MutableTcpPacket, TcpFlags, TcpPacket};
+use pnet::packet::{MutablePacket, Packet};
+use pnet::util::checksum;
+use rand::Rng;
 use std::net::Ipv4Addr;
-use windows::core::{PCSTR, PCWSTR};
-use windows::Win32::Foundation::{FARPROC, HANDLE, HMODULE};
-use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+use std::time::Duration;
+
+// 创建 TCP 数据包
+fn create_tcp_packet(
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq_num: u32,
+    ack_num: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut ethernet_frame_buffer = vec![0u8; 14 + 20 + 20 + payload.len()];
+
+    let mut ethernet_packet = MutableEthernetPacket::new(&mut ethernet_frame_buffer).unwrap();
+    ethernet_packet.set_source(src_mac.into());
+    ethernet_packet.set_destination(dst_mac.into());
+    ethernet_packet.set_ethertype(EtherTypes::Ipv4);
+
+    let mut ipv4_packet = MutableIpv4Packet::new(ethernet_packet.payload_mut()).unwrap();
+    ipv4_packet.set_version(4);
+    ipv4_packet.set_header_length(5);
+    ipv4_packet.set_total_length((20 + 20 + payload.len()) as u16);
+    ipv4_packet.set_next_level_protocol(pnet::packet::ip::IpNextHeaderProtocols::Tcp);
+    ipv4_packet.set_source(src_ip);
+    ipv4_packet.set_destination(dst_ip);
+    ipv4_packet.set_ttl(64);
+    ipv4_packet.set_checksum(0);
+    ipv4_packet.set_checksum(checksum(&ipv4_packet.packet(), 2));
+
+    let mut tcp_packet = MutableTcpPacket::new(ipv4_packet.payload_mut()).unwrap();
+    tcp_packet.set_source(src_port);
+    tcp_packet.set_destination(dst_port);
+    tcp_packet.set_sequence(seq_num);
+    tcp_packet.set_acknowledgement(ack_num);
+    tcp_packet.set_data_offset(5);
+    tcp_packet.set_flags(flags);
+    tcp_packet.set_window(64240);
+    tcp_packet.set_urgent_ptr(0);
+    tcp_packet.set_payload(payload);
+
+    tcp_packet.set_checksum(0);
+    let pseudo_header =
+        pnet::packet::tcp::ipv4_checksum(&tcp_packet.to_immutable(), &src_ip, &dst_ip);
+    tcp_packet.set_checksum(pseudo_header);
+
+    ethernet_frame_buffer
+}
+
+// 发送数据包
+fn send_packet(interface_name: &str, packet: &[u8]) {
+    let interfaces = datalink::interfaces();
+    let interface = interfaces
+        .into_iter()
+        .find(|iface: &NetworkInterface| iface.name == interface_name)
+        .expect("Network interface not found");
+
+    let (mut tx, _) = match datalink::channel(&interface, Default::default()) {
+        Ok(Ethernet(tx, _)) => (tx, ()),
+        Ok(_) => panic!("Unhandled channel type"),
+        Err(e) => panic!("Failed to create datalink channel: {}", e),
+    };
+
+    tx.send_to(packet, None)
+        .expect("Failed to send Ethernet frame");
+}
+
+// 专用于三次握手和控制包接收
+fn listen_for_handshake(
+    interface_name: &str,
+    src_port: u16,
+    dst_port: u16,
+) -> Option<(u32, u32, u8)> {
+    let interfaces = datalink::interfaces();
+    let interface = interfaces
+        .into_iter()
+        .find(|iface: &NetworkInterface| iface.name == interface_name)
+        .expect("Network interface not found");
+
+    let mut rx = match datalink::channel(&interface, Default::default()) {
+        Ok(Ethernet(_, rx)) => rx,
+        Ok(_) => panic!("Unhandled channel type"),
+        Err(e) => panic!("Failed to create datalink channel: {}", e),
+    };
+
+    let timeout = Duration::from_secs(5); // Timeout after 5 seconds
+    let start_time = std::time::Instant::now();
+
+    while start_time.elapsed() < timeout {
+        if let Ok(packet) = rx.next() {
+            let eth_packet = EthernetPacket::new(packet).unwrap();
+
+            if eth_packet.get_ethertype() == EtherTypes::Ipv4 {
+                let ipv4_packet = Ipv4Packet::new(eth_packet.payload()).unwrap();
+
+                if ipv4_packet.get_next_level_protocol()
+                    == pnet::packet::ip::IpNextHeaderProtocols::Tcp
+                {
+                    let tcp_packet = TcpPacket::new(ipv4_packet.payload()).unwrap();
+
+                    if tcp_packet.get_source() == dst_port
+                        && tcp_packet.get_destination() == src_port
+                    {
+                        return Some((
+                            tcp_packet.get_sequence(),
+                            tcp_packet.get_acknowledgement(),
+                            tcp_packet.get_flags(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    println!("Timeout waiting for handshake packet.");
+    None
+}
+
+// 专用于接收完整 HTTP 响应
+fn listen_for_response(interface_name: &str, src_port: u16, dst_port: u16) -> Vec<u8> {
+    let interfaces = datalink::interfaces();
+    let interface = interfaces
+        .into_iter()
+        .find(|iface: &NetworkInterface| iface.name == interface_name)
+        .expect("Network interface not found");
+
+    let mut rx = match datalink::channel(&interface, Default::default()) {
+        Ok(Ethernet(_, rx)) => rx,
+        Ok(_) => panic!("Unhandled channel type"),
+        Err(e) => panic!("Failed to create datalink channel: {}", e),
+    };
+
+    let mut full_response = Vec::new();
+    let timeout = Duration::from_secs(5);
+    let start_time = std::time::Instant::now();
+
+    while start_time.elapsed() < timeout {
+        if let Ok(packet) = rx.next() {
+            let eth_packet = EthernetPacket::new(packet).unwrap();
+
+            if eth_packet.get_ethertype() == EtherTypes::Ipv4 {
+                let ipv4_packet = Ipv4Packet::new(eth_packet.payload()).unwrap();
+
+                if ipv4_packet.get_next_level_protocol()
+                    == pnet::packet::ip::IpNextHeaderProtocols::Tcp
+                {
+                    let tcp_packet = TcpPacket::new(ipv4_packet.payload()).unwrap();
+
+                    if tcp_packet.get_source() == dst_port
+                        && tcp_packet.get_destination() == src_port
+                    {
+                        full_response.extend_from_slice(tcp_packet.payload());
+
+                        // 如果收到 FIN 包，则结束接收
+                        if tcp_packet.get_flags() & TcpFlags::FIN != 0 {
+                            println!("Received FIN from server, ending response collection.");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if full_response.is_empty() {
+        println!("Timeout waiting for response or no data received.");
+    }
+
+    full_response
+}
 
 fn main() {
-    use std::sync::Arc;
-
-    //Must be run as Administrator because we create network adapters
-    //Load the wintun dll file so that we can call the underlying C functions
-    //Unsafe because we are loading an arbitrary dll file
-    let wintun =
-        unsafe { wintun::load_from_path("wintun.dll") }.expect("Failed to load wintun dll");
-
-    //Try to open an adapter with the name "Demo"
-    let adapter = match wintun::Adapter::open(&wintun, "Demo") {
-        Ok(a) => a,
-        Err(_) => {
-            println!("Failed to open wintun adapter, creating a new one");
-            //If loading failed (most likely it didn't exist), create a new one
-            wintun::Adapter::create(&wintun, "Demo", "Example", None)
-                .expect("Failed to create wintun adapter!")
-        }
-    };
-    //Specify the size of the ring buffer the wintun driver should use.
-    let session = Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY).unwrap());
-
-    //Get a 20 byte packet from the ring buffer
-    loop {
-        println!("Sending packet");
-        let mut packet = session.allocate_send_packet(12).unwrap();
-        let bytes: &mut [u8] = packet.bytes_mut();
-        //Write IPV4 version and header length
-        bytes[0] = 0x40;
-
-        //Finish writing IP header
-        bytes[9] = 0x69;
-        bytes[10] = 0x04;
-        bytes[11] = 0x20;
-        //Send the packet to wintun virtual adapter for processing by the system
-        session.send_packet(packet);
-    }
-    //Stop any readers blocking for data on other threads
-    //Only needed when a blocking reader is preventing shutdown Ie. it holds an Arc to the
-    //session, blocking it from being dropped
-    // session.shutdown();
-
-    //the session is stopped on drop
-    //drop(session);
-
-    //drop(adapter)
-    //And the adapter closes its resources when dropped
-    // 后续操作：读写适配器的网络流量...
-}
-
-fn send_ping() {
-    // 替换为你的网卡设备名
-    let device_name = "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}";
-    let mut cap = Capture::from_device(device_name).unwrap().open().unwrap();
-
-    // 本机 MAC 地址（请替换为你的真实 MAC 地址）
+    // 配置网络信息
     let src_mac = [0xf8, 0x9e, 0x94, 0xf2, 0x30, 0x4b];
-    // 目标设备 MAC 地址（请替换为目标设备的 MAC 地址）
     let dst_mac = [0x00, 0x00, 0x5e, 0x00, 0x01, 0x01];
+    let src_ip = "10.20.100.119".parse::<Ipv4Addr>().unwrap();
+    let dst_ip = "93.184.215.14".parse::<Ipv4Addr>().unwrap();
+    // let src_port = 12345;
+    let src_port = rand::thread_rng().gen_range(1024..65535);
+    let dst_port = 80;
 
-    // 本机 IP 地址
-    let src_ip = Ipv4Addr::new(172, 18, 1, 1);
-    // 目标设备 IP 地址（Ping 的目标地址）
-    let dst_ip = Ipv4Addr::new(172, 18, 1, 2);
+    // 三次握手
+    let seq_num = 0x12345678;
+    let ack_num = 0;
+    let syn_packet = create_tcp_packet(
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq_num,
+        ack_num,
+        TcpFlags::SYN,
+        b"",
+    );
+    send_packet(
+        "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}",
+        &syn_packet,
+    );
+    println!("SYN packet sent.");
 
-    // ICMP Echo 请求的初始序列号和标识符
-    let identifier = 1;
-    let sequence = 1;
+    if let Some((server_seq, _, flags)) = listen_for_handshake(
+        "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}",
+        src_port,
+        dst_port,
+    ) {
+        if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
+            println!("Received SYN-ACK.");
+            let ack_packet = create_tcp_packet(
+                src_mac,
+                dst_mac,
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                seq_num + 1,
+                server_seq + 1,
+                TcpFlags::ACK,
+                b"",
+            );
+            send_packet(
+                "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}",
+                &ack_packet,
+            );
+            println!("ACK sent, three-way handshake complete.");
 
-    // 构造数据包
-    let mut pktbuf = [0u8; 98];
+            // 发送 HTTP 请求
+            let http_request =
+                b"GET / HTTP/1.1\r\nHost: www.example.com\r\nConnection: close\r\n\r\n";
+            let http_request_packet = create_tcp_packet(
+                src_mac,
+                dst_mac,
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                seq_num + 1,
+                server_seq + 1,
+                TcpFlags::PSH | TcpFlags::ACK,
+                http_request,
+            );
+            send_packet(
+                "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}",
+                &http_request_packet,
+            );
+            println!("HTTP request sent.");
 
-    // Ethernet Header
-    pktbuf[0..6].copy_from_slice(&dst_mac); // 目标 MAC 地址
-    pktbuf[6..12].copy_from_slice(&src_mac); // 源 MAC 地址
-    pktbuf[12..14].copy_from_slice(&0x0800u16.to_be_bytes()); // Ethertype: IPv4 (0x0800)
-
-    // IP Header
-    pktbuf[14] = 0x45; // IPv4, Header Length = 20 bytes
-    pktbuf[15] = 0x00; // Type of Service
-    pktbuf[16..18].copy_from_slice(&(84u16).to_be_bytes()); // Total Length (IP Header + ICMP)
-    pktbuf[18..20].copy_from_slice(&0x0001u16.to_be_bytes()); // Identification
-    pktbuf[20..22].copy_from_slice(&0x4000u16.to_be_bytes()); // Flags and Fragment Offset
-    pktbuf[22] = 64; // TTL (Time to Live)
-    pktbuf[23] = 1; // Protocol: ICMP (1)
-    pktbuf[24..26].copy_from_slice(&0u16.to_be_bytes()); // Header Checksum (暂时为 0)
-    pktbuf[26..30].copy_from_slice(&src_ip.octets()); // Source IP
-    pktbuf[30..34].copy_from_slice(&dst_ip.octets()); // Destination IP
-
-    // IP Header 校验和
-    let ip_checksum = checksum(&pktbuf[14..34]);
-    pktbuf[24..26].copy_from_slice(&ip_checksum.to_be_bytes());
-
-    // ICMP Header
-    pktbuf[34] = 8; // ICMP Type: Echo Request (8)
-    pktbuf[35] = 0; // Code: 0
-    pktbuf[36..38].copy_from_slice(&0u16.to_be_bytes()); // ICMP 校验和（暂时为 0）
-    pktbuf[38..40].copy_from_slice(&(identifier as u16).to_be_bytes()); // Identifier
-    pktbuf[40..42].copy_from_slice(&(sequence as u16).to_be_bytes()); // Sequence Number
-
-    // 填充 ICMP 数据部分
-    for i in 42..98 {
-        pktbuf[i] = i as u8;
+            // 接收 HTTP 响应
+            let response_payload = listen_for_response(
+                "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}",
+                src_port,
+                dst_port,
+            );
+            if !response_payload.is_empty() {
+                println!("Received HTTP response:");
+                println!("{}", String::from_utf8_lossy(&response_payload));
+            } else {
+                println!("No response received or response was empty.");
+            }
+        }
     }
-
-    // ICMP Header 校验和
-    let icmp_checksum = checksum(&pktbuf[34..98]);
-    pktbuf[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
-
-    // 发送数据包
-    match cap.sendpacket(pktbuf) {
-        Ok(_) => println!("ICMP Echo Request sent successfully!"),
-        Err(e) => eprintln!("Failed to send ICMP Echo Request: {}", e),
-    }
-}
-
-// 计算校验和
-fn checksum(data: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-
-    for chunk in &mut chunks {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-
-    if let Some(&byte) = chunks.remainder().first() {
-        sum += (byte as u32) << 8;
-    }
-
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-
-    !(sum as u16)
 }
