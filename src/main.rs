@@ -59,41 +59,17 @@ fn create_tcp_packet(
 }
 
 // 发送数据包
-fn send_packet(interface_name: &str, packet: &[u8]) {
-    let interfaces = datalink::interfaces();
-    let interface = interfaces
-        .into_iter()
-        .find(|iface: &NetworkInterface| iface.name == interface_name)
-        .expect("Network interface not found");
-
-    let (mut tx, _) = match datalink::channel(&interface, Default::default()) {
-        Ok(Ethernet(tx, _)) => (tx, ()),
-        Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!("Failed to create datalink channel: {}", e),
-    };
-
+fn send_packet(tx: &mut Box<dyn pnet::datalink::DataLinkSender>, packet: &[u8]) {
     tx.send_to(packet, None)
         .expect("Failed to send Ethernet frame");
 }
 
 // 专用于三次握手和控制包接收
 fn listen_for_handshake(
-    interface_name: &str,
+    rx: &mut Box<dyn pnet::datalink::DataLinkReceiver>,
     src_port: u16,
     dst_port: u16,
 ) -> Option<(u32, u32, u8)> {
-    let interfaces = datalink::interfaces();
-    let interface = interfaces
-        .into_iter()
-        .find(|iface: &NetworkInterface| iface.name == interface_name)
-        .expect("Network interface not found");
-
-    let mut rx = match datalink::channel(&interface, Default::default()) {
-        Ok(Ethernet(_, rx)) => rx,
-        Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!("Failed to create datalink channel: {}", e),
-    };
-
     let timeout = Duration::from_secs(5); // Timeout after 5 seconds
     let start_time = std::time::Instant::now();
 
@@ -128,19 +104,11 @@ fn listen_for_handshake(
 }
 
 // 专用于接收完整 HTTP 响应
-fn listen_for_response(interface_name: &str, src_port: u16, dst_port: u16) -> Vec<u8> {
-    let interfaces = datalink::interfaces();
-    let interface = interfaces
-        .into_iter()
-        .find(|iface: &NetworkInterface| iface.name == interface_name)
-        .expect("Network interface not found");
-
-    let mut rx = match datalink::channel(&interface, Default::default()) {
-        Ok(Ethernet(_, rx)) => rx,
-        Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!("Failed to create datalink channel: {}", e),
-    };
-
+fn listen_for_response(
+    rx: &mut Box<dyn pnet::datalink::DataLinkReceiver>,
+    src_port: u16,
+    dst_port: u16,
+) -> Vec<u8> {
     let mut full_response = Vec::new();
     let timeout = Duration::from_secs(5);
     let start_time = std::time::Instant::now();
@@ -186,9 +154,22 @@ fn main() {
     let dst_mac = [0x00, 0x00, 0x5e, 0x00, 0x01, 0x01];
     let src_ip = "10.20.100.119".parse::<Ipv4Addr>().unwrap();
     let dst_ip = "93.184.215.14".parse::<Ipv4Addr>().unwrap();
-    // let src_port = 12345;
     let src_port = rand::thread_rng().gen_range(1024..65535);
     let dst_port = 80;
+
+    // 打开网络接口
+    let interface_name = "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}";
+    let interfaces = datalink::interfaces();
+    let interface = interfaces
+        .into_iter()
+        .find(|iface: &NetworkInterface| iface.name == interface_name)
+        .expect("Network interface not found");
+
+    let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
+        Ok(Ethernet(tx, rx)) => (tx, rx),
+        Ok(_) => panic!("Unhandled channel type"),
+        Err(e) => panic!("Failed to create datalink channel: {}", e),
+    };
 
     // 三次握手
     let seq_num = 0x12345678;
@@ -205,17 +186,10 @@ fn main() {
         TcpFlags::SYN,
         b"",
     );
-    send_packet(
-        "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}",
-        &syn_packet,
-    );
+    send_packet(&mut tx, &syn_packet);
     println!("SYN packet sent.");
 
-    if let Some((server_seq, _, flags)) = listen_for_handshake(
-        "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}",
-        src_port,
-        dst_port,
-    ) {
+    if let Some((server_seq, _, flags)) = listen_for_handshake(&mut rx, src_port, dst_port) {
         if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
             println!("Received SYN-ACK.");
             let ack_packet = create_tcp_packet(
@@ -230,10 +204,7 @@ fn main() {
                 TcpFlags::ACK,
                 b"",
             );
-            send_packet(
-                "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}",
-                &ack_packet,
-            );
+            send_packet(&mut tx, &ack_packet);
             println!("ACK sent, three-way handshake complete.");
 
             // 发送 HTTP 请求
@@ -251,18 +222,11 @@ fn main() {
                 TcpFlags::PSH | TcpFlags::ACK,
                 http_request,
             );
-            send_packet(
-                "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}",
-                &http_request_packet,
-            );
+            send_packet(&mut tx, &http_request_packet);
             println!("HTTP request sent.");
 
             // 接收 HTTP 响应
-            let response_payload = listen_for_response(
-                "\\Device\\NPF_{A884DA93-96DC-41FC-A059-4B79F6B3131E}",
-                src_port,
-                dst_port,
-            );
+            let response_payload = listen_for_response(&mut rx, src_port, dst_port);
             if !response_payload.is_empty() {
                 println!("Received HTTP response:");
                 println!("{}", String::from_utf8_lossy(&response_payload));
